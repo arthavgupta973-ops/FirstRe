@@ -1,0 +1,111 @@
+"""
+Download Plus AI Template as PPTX
+==================================
+Downloads your Plus AI template as a PPTX file so you can use it
+with the true template converter.
+
+Usage:
+    python download_template.py
+
+This creates a 'company_template.pptx' file that contains your
+company's styling (colors, fonts, backgrounds, layouts).
+"""
+
+import time
+import requests
+
+# =============================================================================
+# CONFIGURATION - UPDATE THESE
+# =============================================================================
+
+PLUSAI_API_TOKEN = ""  # Your Plus AI token
+PLUSAI_TEMPLATE_ID = ""  # Your company template ID
+
+OUTPUT_FILE = "company_template.pptx"
+
+
+def download_template():
+    """Download Plus AI template as PPTX file"""
+    
+    if not PLUSAI_API_TOKEN or not PLUSAI_TEMPLATE_ID:
+        print("Error: Update PLUSAI_API_TOKEN and PLUSAI_TEMPLATE_ID in the script")
+        return False
+    
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {PLUSAI_API_TOKEN}"
+    }
+    
+    print("=" * 50)
+    print("Downloading Plus AI Template")
+    print("=" * 50)
+    print(f"Template ID: {PLUSAI_TEMPLATE_ID}")
+    
+    # Create a minimal presentation to get the template styling
+    print("\nCreating minimal presentation...")
+    
+    response = requests.post(
+        "https://api.plusdocs.com/r/v0/presentation",
+        headers=headers,
+        json={
+            "prompt": "Create a presentation with these slides:\n\nSlide 1: Title slide with text 'Template'\nSlide 2: A blank content slide\nSlide 3: A slide with bullet points: Point 1, Point 2, Point 3",
+            "templateId": PLUSAI_TEMPLATE_ID,
+            "numberOfSlides": 3,
+            "language": "en",
+            "includeUserTips": False
+        }
+    )
+    
+    if response.status_code == 429:
+        print("Rate limit exceeded. Wait 1-2 minutes and try again.")
+        return False
+    
+    if response.status_code != 200:
+        print(f"Error: {response.status_code} - {response.text}")
+        return False
+    
+    data = response.json()
+    polling_url = data.get("pollingUrl")
+    
+    if not polling_url:
+        print("Error: No polling URL returned")
+        return False
+    
+    print(f"✓ Created - ID: {data.get('id')}")
+    print("\nWaiting for generation...")
+    
+    # Poll for completion
+    start = time.time()
+    while time.time() - start < 300:
+        time.sleep(5)
+        
+        result = requests.get(polling_url, headers=headers).json()
+        status = result.get("status")
+        print(f"  Status: {status}")
+        
+        if status == "GENERATED":
+            pptx_url = result.get("url")
+            
+            # Download the file
+            print(f"\n✓ Generated! Downloading...")
+            
+            pptx_response = requests.get(pptx_url)
+            with open(OUTPUT_FILE, "wb") as f:
+                f.write(pptx_response.content)
+            
+            print(f"✓ Template saved as: {OUTPUT_FILE}")
+            print("\nYou can now use this template with the true converter:")
+            print(f"  python ppt_true_converter.py source.pptx {OUTPUT_FILE} output.pptx")
+            
+            return True
+        
+        if status in ["FAILED", "ERROR"]:
+            print(f"Error: Generation failed - {result}")
+            return False
+    
+    print("Timeout waiting for generation")
+    return False
+
+
+if __name__ == "__main__":
+    download_template()

@@ -1,0 +1,783 @@
+"""
+PPT Template Converter - Vision-Based Approach
+===============================================
+Converts PowerPoint presentations using GPT-4o Vision to interpret slides visually.
+
+This approach:
+1. Converts each slide to an image (PNG/JPEG)
+2. Sends images to GPT-4o Vision for complete visual interpretation
+3. Captures: layout, design, images, charts, text, colors, structure
+4. Generates detailed prompt for Plus AI
+
+Usage:
+    python ppt_vision_converter.py input.pptx output.pptx
+
+Requirements:
+    - LibreOffice (for PPTX to PDF conversion)
+    - pdf2image / Poppler (for PDF to images)
+    - Or: Microsoft PowerPoint COM (Windows only)
+"""
+
+import os
+import sys
+import json
+import time
+import base64
+import subprocess
+import tempfile
+import requests
+from pathlib import Path
+from typing import Optional, List, Dict, Tuple
+from dataclasses import dataclass
+
+
+# =============================================================================
+# CONFIGURATION - UPDATE THESE VALUES
+# =============================================================================
+
+# Azure OpenAI Configuration (your pattern)
+AZURE_OPENAI_API_KEY = ""  # Your API key
+AZURE_OPENAI_BASE_URL = ""  # Your base URL
+AZURE_OPENAI_MODEL = "azure.gpt-4o-2024-11-20"  # Must be a vision-capable model
+
+# Plus AI Configuration
+PLUSAI_API_TOKEN = ""  # Your Plus AI API token
+PLUSAI_TEMPLATE_ID = ""  # Your company template ID
+
+
+# =============================================================================
+# SLIDE TO IMAGE CONVERTER
+# =============================================================================
+
+class SlideToImageConverter:
+    """Converts PowerPoint slides to images"""
+    
+    def __init__(self, output_dir: str = None):
+        self.output_dir = output_dir or tempfile.mkdtemp()
+        Path(self.output_dir).mkdir(parents=True, exist_ok=True)
+    
+    def convert(self, pptx_path: str) -> List[str]:
+        """
+        Convert PPTX to images (one per slide)
+        
+        Returns:
+            List of image file paths
+        """
+        pptx_path = os.path.abspath(pptx_path)
+        
+        # Try different conversion methods
+        try:
+            return self._convert_via_libreoffice(pptx_path)
+        except Exception as e:
+            print(f"LibreOffice conversion failed: {e}")
+            
+        try:
+            return self._convert_via_pdf2image(pptx_path)
+        except Exception as e:
+            print(f"pdf2image conversion failed: {e}")
+        
+        # Windows-only fallback
+        if sys.platform == 'win32':
+            try:
+                return self._convert_via_comtypes(pptx_path)
+            except Exception as e:
+                print(f"COM conversion failed: {e}")
+        
+        raise Exception("No conversion method available. Install LibreOffice or Poppler.")
+    
+    def _convert_via_libreoffice(self, pptx_path: str) -> List[str]:
+        """Convert using LibreOffice (cross-platform)"""
+        print("Converting slides using LibreOffice...")
+        
+        # First convert PPTX to PDF
+        pdf_path = os.path.join(self.output_dir, "presentation.pdf")
+        
+        # Run LibreOffice headless conversion
+        cmd = [
+            "soffice",
+            "--headless",
+            "--convert-to", "pdf",
+            "--outdir", self.output_dir,
+            pptx_path
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise Exception(f"LibreOffice failed: {result.stderr}")
+        
+        # Find the generated PDF
+        pptx_name = Path(pptx_path).stem
+        pdf_path = os.path.join(self.output_dir, f"{pptx_name}.pdf")
+        
+        if not os.path.exists(pdf_path):
+            raise Exception(f"PDF not created: {pdf_path}")
+        
+        # Convert PDF to images using pdftoppm (from Poppler)
+        return self._pdf_to_images(pdf_path)
+    
+    def _convert_via_pdf2image(self, pptx_path: str) -> List[str]:
+        """Convert using pdf2image library"""
+        try:
+            from pdf2image import convert_from_path
+        except ImportError:
+            raise Exception("pdf2image not installed. Run: pip install pdf2image")
+        
+        print("Converting slides using pdf2image...")
+        
+        # First need to convert PPTX to PDF
+        pdf_path = os.path.join(self.output_dir, "presentation.pdf")
+        
+        # Try LibreOffice for PPTX->PDF
+        cmd = ["soffice", "--headless", "--convert-to", "pdf", "--outdir", self.output_dir, pptx_path]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        pptx_name = Path(pptx_path).stem
+        pdf_path = os.path.join(self.output_dir, f"{pptx_name}.pdf")
+        
+        if not os.path.exists(pdf_path):
+            raise Exception("Could not create PDF from PPTX")
+        
+        # Convert PDF pages to images
+        images = convert_from_path(pdf_path, dpi=150, fmt='jpeg')
+        
+        image_paths = []
+        for i, image in enumerate(images):
+            img_path = os.path.join(self.output_dir, f"slide_{i+1:03d}.jpg")
+            image.save(img_path, 'JPEG', quality=90)
+            image_paths.append(img_path)
+        
+        return image_paths
+    
+    def _pdf_to_images(self, pdf_path: str) -> List[str]:
+        """Convert PDF to images using pdftoppm"""
+        output_prefix = os.path.join(self.output_dir, "slide")
+        
+        cmd = [
+            "pdftoppm",
+            "-jpeg",
+            "-r", "150",  # 150 DPI - good balance of quality and size
+            pdf_path,
+            output_prefix
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise Exception(f"pdftoppm failed: {result.stderr}")
+        
+        # Find all generated images
+        image_paths = sorted(Path(self.output_dir).glob("slide-*.jpg"))
+        return [str(p) for p in image_paths]
+    
+    def _convert_via_comtypes(self, pptx_path: str) -> List[str]:
+        """Convert using PowerPoint COM (Windows only)"""
+        import comtypes.client
+        
+        print("Converting slides using PowerPoint COM...")
+        
+        powerpoint = comtypes.client.CreateObject("PowerPoint.Application")
+        powerpoint.Visible = 1
+        
+        presentation = powerpoint.Presentations.Open(pptx_path)
+        
+        image_paths = []
+        for i, slide in enumerate(presentation.Slides):
+            img_path = os.path.join(self.output_dir, f"slide_{i+1:03d}.png")
+            slide.Export(img_path, "PNG", 1920, 1080)
+            image_paths.append(img_path)
+        
+        presentation.Close()
+        powerpoint.Quit()
+        
+        return image_paths
+
+
+# =============================================================================
+# AZURE OPENAI VISION CLIENT
+# =============================================================================
+
+class AzureOpenAIVisionClient:
+    """Azure OpenAI client with vision capabilities"""
+    
+    def __init__(
+        self,
+        api_key: str = AZURE_OPENAI_API_KEY,
+        base_url: str = AZURE_OPENAI_BASE_URL,
+        model: str = AZURE_OPENAI_MODEL
+    ):
+        self.api_key = api_key
+        self.base_url = base_url.rstrip('/')
+        self.model = model
+        self.headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}"
+        }
+    
+    def encode_image(self, image_path: str) -> Tuple[str, str]:
+        """Encode image to base64 and detect MIME type"""
+        ext = Path(image_path).suffix.lower()
+        mime_types = {
+            '.jpg': 'image/jpeg',
+            '.jpeg': 'image/jpeg',
+            '.png': 'image/png',
+            '.gif': 'image/gif',
+            '.webp': 'image/webp'
+        }
+        mime_type = mime_types.get(ext, 'image/jpeg')
+        
+        with open(image_path, 'rb') as f:
+            image_data = base64.b64encode(f.read()).decode('utf-8')
+        
+        return image_data, mime_type
+    
+    def analyze_slide(self, image_path: str, slide_number: int) -> Optional[str]:
+        """
+        Analyze a single slide image using GPT-4o Vision - VERBATIM extraction
+        
+        Returns exact content of the slide for faithful replication
+        """
+        image_data, mime_type = self.encode_image(image_path)
+        
+        messages = [
+            {
+                "role": "system",
+                "content": """You are a precise text extraction and layout analysis tool.
+Your job is to capture EXACTLY what is on this slide - VERBATIM, word-for-word.
+
+CRITICAL INSTRUCTIONS:
+1. Extract ALL text EXACTLY as written - do not paraphrase, summarize, or interpret
+2. Copy text character-for-character including punctuation, capitalization, numbers
+3. If text says "Q3 Revenue: $2.3M" - write EXACTLY "Q3 Revenue: $2.3M"
+4. Count bullet points precisely - if there are 4 bullets, list exactly 4
+5. Preserve line breaks and text hierarchy exactly as shown
+6. Note image/chart DESCRIPTIONS but do not invent details not visible
+
+OUTPUT FORMAT:
+TITLE: [exact title text or "None" if no title]
+SUBTITLE: [exact subtitle or "None"]
+
+TEXT CONTENT:
+[All text exactly as it appears, preserving structure]
+
+BULLET POINTS: (if any)
+• [exact bullet 1]
+• [exact bullet 2]
+[etc - exact count]
+
+DATA/NUMBERS: (if any)
+[List all specific numbers, percentages, currency values exactly]
+
+VISUAL ELEMENTS:
+- Images: [describe what images show - position noted]
+- Charts: [type, visible labels/values exactly as shown]
+- Icons: [what icons, where placed]
+
+LAYOUT: [brief: "two columns", "centered title", etc.]
+
+DO NOT add explanations, interpretations, summaries, or any content not visible."""
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": f"Extract VERBATIM content from Slide {slide_number}. Copy all text exactly as shown:"
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{mime_type};base64,{image_data}",
+                            "detail": "high"
+                        }
+                    }
+                ]
+            }
+        ]
+        
+        return self._call_api(messages, max_tokens=2000)
+    
+    def analyze_presentation_overview(self, image_paths: List[str]) -> Optional[str]:
+        """
+        Analyze multiple slides to understand overall presentation structure
+        
+        Sends first few and last slides to understand flow
+        """
+        # Select key slides: first 2, middle, last 2
+        total = len(image_paths)
+        if total <= 5:
+            selected_indices = list(range(total))
+        else:
+            selected_indices = [0, 1, total // 2, total - 2, total - 1]
+        
+        # Build content with multiple images
+        content = [{"type": "text", "text": "Analyze this presentation's overall structure, theme, and flow:"}]
+        
+        for idx in selected_indices:
+            image_data, mime_type = self.encode_image(image_paths[idx])
+            content.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:{mime_type};base64,{image_data}",
+                    "detail": "low"  # Low detail for overview
+                }
+            })
+            content.append({"type": "text", "text": f"(Slide {idx + 1})"})
+        
+        messages = [
+            {
+                "role": "system",
+                "content": """Analyze these presentation slides and describe:
+1. Overall theme and topic
+2. Presentation structure (intro, sections, conclusion)
+3. Design style and color scheme
+4. Target audience and tone
+5. Key messages and narrative flow"""
+            },
+            {
+                "role": "user",
+                "content": content
+            }
+        ]
+        
+        return self._call_api(messages, max_tokens=1500)
+    
+    def generate_plusai_prompt(
+        self,
+        overview: str,
+        slide_analyses: List[str],
+        num_slides: int
+    ) -> Optional[str]:
+        """
+        Generate an EXACT REPLICATION prompt for Plus AI
+        """
+        combined_analysis = f"""PRESENTATION OVERVIEW:
+{overview}
+
+DETAILED SLIDE-BY-SLIDE CONTENT (VERBATIM):
+"""
+        for i, analysis in enumerate(slide_analyses, 1):
+            combined_analysis += f"\n--- SLIDE {i} ---\n{analysis}\n"
+        
+        messages = [
+            {
+                "role": "system",
+                "content": """You are creating a prompt for Plus AI to EXACTLY replicate a presentation.
+
+CRITICAL RULES - FOLLOW STRICTLY:
+1. DO NOT add any new content, text, or information
+2. DO NOT paraphrase or summarize - use EXACT text from the analysis
+3. DO NOT add creative flourishes, additional bullet points, or explanations
+4. DO NOT change the order of content
+5. DO NOT add titles or text that wasn't in the original
+6. COPY text VERBATIM - word for word, character for character
+7. If a slide has 3 bullet points, output EXACTLY 3 bullet points
+8. If a slide has specific numbers (e.g., "$2.3M", "23%"), use EXACTLY those numbers
+9. Preserve empty slides if they exist
+10. Match the EXACT number of slides
+
+FORMAT YOUR OUTPUT AS:
+"Create a presentation with EXACTLY [N] slides. This is an EXACT REPLICATION task - do not add, remove, or modify any content.
+
+SLIDE 1:
+Title: [exact title]
+Content: [exact content verbatim]
+
+SLIDE 2:
+Title: [exact title]
+Content: [exact content verbatim]
+..."
+
+Output ONLY the prompt, no preamble or explanation."""
+            },
+            {
+                "role": "user",
+                "content": f"""Create an EXACT REPLICATION prompt for this {num_slides}-slide presentation.
+
+REMEMBER:
+- Zero creativity - copy exactly
+- Every word verbatim
+- Same slide count: exactly {num_slides} slides
+- No additions or modifications
+
+CONTENT TO REPLICATE:
+{combined_analysis}
+
+Generate the exact replication prompt now:"""
+            }
+        ]
+        
+        return self._call_api(messages, max_tokens=4000)
+    
+    def _call_api(self, messages: List[Dict], max_tokens: int = 4000) -> Optional[str]:
+        """Make API call to Azure OpenAI"""
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": 0.3
+        }
+        
+        url = f"{self.base_url}/openai/deployments/{self.model}/chat/completions"
+        
+        try:
+            response = requests.post(url, headers=self.headers, json=payload, timeout=120)
+            
+            if response.status_code == 200:
+                data = response.json()
+                return data.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+            else:
+                print(f"API Error: {response.status_code}")
+                print(f"Response: {response.text}")
+                return None
+                
+        except requests.exceptions.Timeout:
+            print("API request timed out")
+            return None
+        except requests.exceptions.RequestException as e:
+            print(f"Request Error: {e}")
+            return None
+
+
+# =============================================================================
+# PLUS AI CLIENT
+# =============================================================================
+
+class PlusAIClient:
+    """Client for Plus AI Presentations API"""
+    
+    def __init__(
+        self,
+        api_token: str = PLUSAI_API_TOKEN,
+        template_id: str = PLUSAI_TEMPLATE_ID
+    ):
+        self.api_token = api_token
+        self.template_id = template_id
+        self.base_url = "https://api.plusdocs.com/r/v0"
+        self.headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_token}"
+        }
+    
+    def create_and_wait(self, prompt: str, num_slides: Optional[int] = None) -> Optional[str]:
+        """Create presentation and wait for completion - EXACT REPLICATION mode"""
+        url = f"{self.base_url}/presentation"
+        
+        # Prepend strict replication instructions
+        strict_prompt = f"""CRITICAL: This is an EXACT REPLICATION task.
+DO NOT add any new content, text, bullet points, or slides.
+DO NOT modify, paraphrase, summarize, or enhance any text.
+DO NOT add introductions, conclusions, summaries, or transitions not specified.
+DO NOT add "Thank You" slides or any content not explicitly listed.
+Copy everything VERBATIM - exactly as specified below.
+Use EXACTLY {num_slides} slides - no more, no less.
+
+{prompt}"""
+        
+        payload = {
+            "prompt": strict_prompt,
+            "language": "en",
+            "includeUserTips": False
+        }
+        
+        if self.template_id:
+            payload["templateId"] = self.template_id
+        
+        if num_slides:
+            payload["numberOfSlides"] = min(num_slides, 30)
+        
+        print("Creating presentation with Plus AI...")
+        print(f"  Template: {self.template_id or 'default'}")
+        print(f"  Slides: {num_slides} (exact)")
+        
+        response = requests.post(url, headers=self.headers, json=payload)
+        
+        if response.status_code == 429:
+            raise Exception("Rate limit exceeded. Wait 1-2 minutes.")
+        
+        response.raise_for_status()
+        data = response.json()
+        
+        polling_url = data.get("pollingUrl")
+        print(f"✓ Created - ID: {data.get('id')}")
+        
+        if not polling_url:
+            return None
+        
+        # Poll for completion
+        print("Waiting for generation...")
+        start = time.time()
+        
+        while time.time() - start < 300:  # 5 minute timeout
+            time.sleep(5)
+            
+            resp = requests.get(polling_url, headers=self.headers)
+            resp.raise_for_status()
+            result = resp.json()
+            
+            status = result.get("status")
+            print(f"  Status: {status} ({int(time.time() - start)}s)")
+            
+            if status == "GENERATED":
+                print("✓ Complete!")
+                return result.get("url")
+            
+            if status in ["FAILED", "ERROR"]:
+                print(f"✗ Failed: {result}")
+                return None
+        
+        print("✗ Timeout")
+        return None
+    
+    def download(self, url: str, output_path: str) -> bool:
+        """Download the presentation"""
+        try:
+            print(f"Downloading to {output_path}...")
+            response = requests.get(url, stream=True)
+            response.raise_for_status()
+            
+            with open(output_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            
+            print("✓ Downloaded!")
+            return True
+        except Exception as e:
+            print(f"✗ Failed: {e}")
+            return False
+
+
+# =============================================================================
+# MAIN CONVERTER
+# =============================================================================
+
+class PPTVisionConverter:
+    """
+    Main converter using vision-based slide analysis
+    """
+    
+    def __init__(
+        self,
+        azure_api_key: str = AZURE_OPENAI_API_KEY,
+        azure_base_url: str = AZURE_OPENAI_BASE_URL,
+        azure_model: str = AZURE_OPENAI_MODEL,
+        plusai_token: str = PLUSAI_API_TOKEN,
+        plusai_template: str = PLUSAI_TEMPLATE_ID
+    ):
+        self.vision = AzureOpenAIVisionClient(azure_api_key, azure_base_url, azure_model)
+        self.plusai = PlusAIClient(plusai_token, plusai_template)
+        self.temp_dir = None
+    
+    def convert(
+        self,
+        input_path: str,
+        output_path: str,
+        preserve_slide_count: bool = True,
+        save_debug: bool = True
+    ) -> bool:
+        """
+        Convert presentation using vision analysis
+        """
+        print("=" * 70)
+        print("PPT TEMPLATE CONVERTER (Vision-Based)")
+        print("=" * 70)
+        
+        # Create temp directory
+        self.temp_dir = tempfile.mkdtemp(prefix="ppt_convert_")
+        debug_dir = Path(output_path).parent / "debug"
+        if save_debug:
+            debug_dir.mkdir(exist_ok=True)
+        
+        try:
+            # Step 1: Convert slides to images
+            print("\n[STEP 1/5] Converting slides to images...")
+            print("-" * 50)
+            
+            converter = SlideToImageConverter(self.temp_dir)
+            image_paths = converter.convert(input_path)
+            num_slides = len(image_paths)
+            
+            print(f"✓ Converted {num_slides} slides to images")
+            
+            # Step 2: Analyze overall presentation
+            print("\n[STEP 2/5] Analyzing presentation overview...")
+            print("-" * 50)
+            
+            overview = self.vision.analyze_presentation_overview(image_paths)
+            if not overview:
+                print("✗ Failed to analyze overview")
+                return False
+            
+            print(f"✓ Overview analyzed ({len(overview)} chars)")
+            
+            if save_debug:
+                with open(debug_dir / "01_overview.txt", "w") as f:
+                    f.write(overview)
+            
+            # Step 3: Analyze each slide in detail
+            print("\n[STEP 3/5] Analyzing each slide...")
+            print("-" * 50)
+            
+            slide_analyses = []
+            for i, img_path in enumerate(image_paths):
+                print(f"  Analyzing slide {i+1}/{num_slides}...", end=" ")
+                
+                analysis = self.vision.analyze_slide(img_path, i + 1)
+                if analysis:
+                    slide_analyses.append(analysis)
+                    print(f"✓ ({len(analysis)} chars)")
+                else:
+                    slide_analyses.append(f"[Slide {i+1} - analysis failed]")
+                    print("✗")
+                
+                # Small delay to avoid rate limits
+                if i < num_slides - 1:
+                    time.sleep(1)
+            
+            if save_debug:
+                with open(debug_dir / "02_slide_analyses.json", "w") as f:
+                    json.dump({
+                        f"slide_{i+1}": analysis 
+                        for i, analysis in enumerate(slide_analyses)
+                    }, f, indent=2)
+            
+            # Step 4: Generate Plus AI prompt
+            print("\n[STEP 4/5] Generating Plus AI prompt...")
+            print("-" * 50)
+            
+            prompt = self.vision.generate_plusai_prompt(
+                overview, 
+                slide_analyses,
+                num_slides
+            )
+            
+            if not prompt:
+                print("✗ Failed to generate prompt")
+                return False
+            
+            print(f"✓ Prompt generated ({len(prompt)} chars)")
+            
+            if save_debug:
+                with open(debug_dir / "03_plusai_prompt.txt", "w") as f:
+                    f.write(prompt)
+            
+            # Step 5: Generate with Plus AI
+            print("\n[STEP 5/5] Generating presentation with Plus AI...")
+            print("-" * 50)
+            
+            target_slides = num_slides if preserve_slide_count else None
+            download_url = self.plusai.create_and_wait(prompt, target_slides)
+            
+            if not download_url:
+                print("✗ Generation failed")
+                return False
+            
+            # Download result
+            success = self.plusai.download(download_url, output_path)
+            
+            if success:
+                print("\n" + "=" * 70)
+                print("SUCCESS!")
+                print("=" * 70)
+                print(f"\n📥 Output: {output_path}")
+                print(f"🔗 URL: {download_url}")
+                if save_debug:
+                    print(f"📁 Debug files: {debug_dir}")
+            
+            return success
+            
+        finally:
+            # Cleanup temp files
+            import shutil
+            if self.temp_dir and os.path.exists(self.temp_dir):
+                shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+
+# =============================================================================
+# CLI
+# =============================================================================
+
+def check_dependencies():
+    """Check if required tools are available"""
+    issues = []
+    
+    # Check LibreOffice
+    try:
+        result = subprocess.run(["soffice", "--version"], capture_output=True, text=True)
+        if result.returncode != 0:
+            issues.append("LibreOffice not working properly")
+    except FileNotFoundError:
+        issues.append("LibreOffice not found. Install with: sudo apt install libreoffice")
+    
+    # Check Poppler (pdftoppm)
+    try:
+        result = subprocess.run(["pdftoppm", "-v"], capture_output=True, text=True)
+    except FileNotFoundError:
+        issues.append("Poppler not found. Install with: sudo apt install poppler-utils")
+    
+    return issues
+
+
+def main():
+    if len(sys.argv) < 3:
+        print("""
+PPT Template Converter (Vision-Based)
+=====================================
+Uses GPT-4o Vision to analyze slides and recreate with your template.
+
+Usage:
+    python ppt_vision_converter.py input.pptx output.pptx
+
+Prerequisites:
+    - LibreOffice: sudo apt install libreoffice
+    - Poppler: sudo apt install poppler-utils
+
+Configuration (update at top of script):
+    - AZURE_OPENAI_API_KEY
+    - AZURE_OPENAI_BASE_URL  
+    - AZURE_OPENAI_MODEL (must support vision, e.g., gpt-4o)
+    - PLUSAI_API_TOKEN
+    - PLUSAI_TEMPLATE_ID
+""")
+        sys.exit(1)
+    
+    input_file = sys.argv[1]
+    output_file = sys.argv[2]
+    
+    # Check configuration
+    missing = []
+    if not AZURE_OPENAI_API_KEY:
+        missing.append("AZURE_OPENAI_API_KEY")
+    if not AZURE_OPENAI_BASE_URL:
+        missing.append("AZURE_OPENAI_BASE_URL")
+    if not PLUSAI_API_TOKEN:
+        missing.append("PLUSAI_API_TOKEN")
+    if not PLUSAI_TEMPLATE_ID:
+        missing.append("PLUSAI_TEMPLATE_ID")
+    
+    if missing:
+        print("Missing configuration. Update these in the script:")
+        for m in missing:
+            print(f"  - {m}")
+        sys.exit(1)
+    
+    # Check dependencies
+    dep_issues = check_dependencies()
+    if dep_issues:
+        print("Missing dependencies:")
+        for issue in dep_issues:
+            print(f"  - {issue}")
+        sys.exit(1)
+    
+    # Check input file
+    if not os.path.exists(input_file):
+        print(f"Error: File not found: {input_file}")
+        sys.exit(1)
+    
+    # Run conversion
+    converter = PPTVisionConverter()
+    success = converter.convert(input_file, output_file)
+    
+    sys.exit(0 if success else 1)
+
+
+if __name__ == "__main__":
+    main()
