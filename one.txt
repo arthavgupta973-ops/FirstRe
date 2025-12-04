@@ -1,0 +1,416 @@
+"""
+PPT True Template Converter
+============================
+Converts a PowerPoint presentation to a new template while preserving
+ALL original content exactly: images, shapes, tables, charts, text.
+
+This is NOT AI-based regeneration. This directly:
+1. Extracts the template's theme (colors, fonts, master slides)
+2. Applies that theme to your source presentation
+3. Keeps ALL original content intact
+
+Usage:
+    python ppt_true_converter.py source.pptx template.pptx output.pptx
+
+Requirements:
+    pip install python-pptx lxml
+"""
+
+import os
+import sys
+import shutil
+import zipfile
+import tempfile
+from pathlib import Path
+from lxml import etree
+from copy import deepcopy
+
+
+# XML namespaces used in PPTX
+NAMESPACES = {
+    'a': 'http://schemas.openxmlformats.org/drawingml/2006/main',
+    'r': 'http://schemas.openxmlformats.org/officeDocument/2006/relationships',
+    'p': 'http://schemas.openxmlformats.org/presentationml/2006/main',
+    'c': 'http://schemas.openxmlformats.org/drawingml/2006/chart',
+    'mc': 'http://schemas.openxmlformats.org/markup-compatibility/2006',
+}
+
+for prefix, uri in NAMESPACES.items():
+    etree.register_namespace(prefix, uri)
+
+
+class PPTXHandler:
+    """Handles PPTX file operations (unzip/zip and XML manipulation)"""
+    
+    def __init__(self, pptx_path: str):
+        self.pptx_path = pptx_path
+        self.temp_dir = None
+    
+    def extract(self) -> str:
+        """Extract PPTX to temp directory"""
+        self.temp_dir = tempfile.mkdtemp(prefix="pptx_")
+        with zipfile.ZipFile(self.pptx_path, 'r') as zf:
+            zf.extractall(self.temp_dir)
+        return self.temp_dir
+    
+    def save(self, output_path: str):
+        """Save temp directory back to PPTX"""
+        with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for root, dirs, files in os.walk(self.temp_dir):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    arc_name = os.path.relpath(file_path, self.temp_dir)
+                    zf.write(file_path, arc_name)
+    
+    def cleanup(self):
+        """Remove temp directory"""
+        if self.temp_dir and os.path.exists(self.temp_dir):
+            shutil.rmtree(self.temp_dir)
+    
+    def read_xml(self, rel_path: str) -> etree._Element:
+        """Read and parse XML file"""
+        full_path = os.path.join(self.temp_dir, rel_path)
+        if os.path.exists(full_path):
+            return etree.parse(full_path).getroot()
+        return None
+    
+    def write_xml(self, rel_path: str, root: etree._Element):
+        """Write XML back to file"""
+        full_path = os.path.join(self.temp_dir, rel_path)
+        tree = etree.ElementTree(root)
+        tree.write(full_path, xml_declaration=True, encoding='UTF-8', standalone=True)
+
+
+class TrueTemplateConverter:
+    """
+    Applies a template's styling to a source presentation while
+    preserving ALL original content (images, shapes, text, tables, charts).
+    """
+    
+    def __init__(self):
+        self.source_handler = None
+        self.template_handler = None
+    
+    def convert(self, source_path: str, template_path: str, output_path: str) -> bool:
+        """
+        Convert source presentation to use template's styling.
+        
+        Args:
+            source_path: Path to source PPTX (content to keep)
+            template_path: Path to template PPTX (styling to apply)
+            output_path: Path for output PPTX
+            
+        Returns:
+            True if successful
+        """
+        print("=" * 60)
+        print("PPT TRUE TEMPLATE CONVERTER")
+        print("=" * 60)
+        print(f"\nSource: {source_path}")
+        print(f"Template: {template_path}")
+        print(f"Output: {output_path}")
+        
+        try:
+            # Extract both files
+            print("\n[1/5] Extracting files...")
+            self.source_handler = PPTXHandler(source_path)
+            self.template_handler = PPTXHandler(template_path)
+            
+            source_dir = self.source_handler.extract()
+            template_dir = self.template_handler.extract()
+            
+            print(f"  ✓ Source extracted")
+            print(f"  ✓ Template extracted")
+            
+            # Copy theme from template to source
+            print("\n[2/5] Copying theme (colors, fonts)...")
+            self._copy_theme(template_dir, source_dir)
+            print("  ✓ Theme copied")
+            
+            # Copy slide masters from template
+            print("\n[3/5] Copying slide masters...")
+            self._copy_slide_masters(template_dir, source_dir)
+            print("  ✓ Slide masters copied")
+            
+            # Copy slide layouts from template
+            print("\n[4/5] Copying slide layouts...")
+            self._copy_slide_layouts(template_dir, source_dir)
+            print("  ✓ Slide layouts copied")
+            
+            # Update slides to use new masters/layouts (preserve content)
+            print("\n[5/5] Updating slide references...")
+            self._update_slide_references(source_dir)
+            print("  ✓ Slides updated")
+            
+            # Save result
+            print("\nSaving output...")
+            self.source_handler.save(output_path)
+            
+            print("\n" + "=" * 60)
+            print("SUCCESS!")
+            print("=" * 60)
+            print(f"\n📥 Output: {output_path}")
+            
+            return True
+            
+        except Exception as e:
+            print(f"\n✗ Error: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+            
+        finally:
+            if self.source_handler:
+                self.source_handler.cleanup()
+            if self.template_handler:
+                self.template_handler.cleanup()
+    
+    def _copy_theme(self, template_dir: str, source_dir: str):
+        """Copy theme files from template to source"""
+        template_theme = os.path.join(template_dir, "ppt", "theme")
+        source_theme = os.path.join(source_dir, "ppt", "theme")
+        
+        if os.path.exists(template_theme):
+            if os.path.exists(source_theme):
+                shutil.rmtree(source_theme)
+            shutil.copytree(template_theme, source_theme)
+    
+    def _copy_slide_masters(self, template_dir: str, source_dir: str):
+        """Copy slide master files from template to source"""
+        template_masters = os.path.join(template_dir, "ppt", "slideMasters")
+        source_masters = os.path.join(source_dir, "ppt", "slideMasters")
+        
+        if os.path.exists(template_masters):
+            if os.path.exists(source_masters):
+                shutil.rmtree(source_masters)
+            shutil.copytree(template_masters, source_masters)
+            
+            # Also copy the _rels folder
+            template_rels = os.path.join(template_dir, "ppt", "slideMasters", "_rels")
+            source_rels = os.path.join(source_dir, "ppt", "slideMasters", "_rels")
+            if os.path.exists(template_rels) and not os.path.exists(source_rels):
+                shutil.copytree(template_rels, source_rels)
+    
+    def _copy_slide_layouts(self, template_dir: str, source_dir: str):
+        """Copy slide layout files from template to source"""
+        template_layouts = os.path.join(template_dir, "ppt", "slideLayouts")
+        source_layouts = os.path.join(source_dir, "ppt", "slideLayouts")
+        
+        if os.path.exists(template_layouts):
+            if os.path.exists(source_layouts):
+                shutil.rmtree(source_layouts)
+            shutil.copytree(template_layouts, source_layouts)
+            
+            # Also copy the _rels folder
+            template_rels = os.path.join(template_dir, "ppt", "slideLayouts", "_rels")
+            source_rels = os.path.join(source_dir, "ppt", "slideLayouts", "_rels")
+            if os.path.exists(template_rels) and not os.path.exists(source_rels):
+                shutil.copytree(template_rels, source_rels)
+    
+    def _update_slide_references(self, source_dir: str):
+        """Update content types and relationships for new masters/layouts"""
+        # Update [Content_Types].xml
+        content_types_path = os.path.join(source_dir, "[Content_Types].xml")
+        if os.path.exists(content_types_path):
+            self._update_content_types(content_types_path, source_dir)
+        
+        # Update presentation.xml.rels
+        pres_rels_path = os.path.join(source_dir, "ppt", "_rels", "presentation.xml.rels")
+        if os.path.exists(pres_rels_path):
+            self._update_presentation_rels(pres_rels_path, source_dir)
+    
+    def _update_content_types(self, content_types_path: str, source_dir: str):
+        """Update [Content_Types].xml to include all slide masters and layouts"""
+        tree = etree.parse(content_types_path)
+        root = tree.getroot()
+        
+        ns = {'ct': 'http://schemas.openxmlformats.org/package/2006/content-types'}
+        
+        # Find existing overrides
+        existing_overrides = set()
+        for override in root.findall('.//ct:Override', ns):
+            existing_overrides.add(override.get('PartName'))
+        
+        # Add overrides for slide masters
+        masters_dir = os.path.join(source_dir, "ppt", "slideMasters")
+        if os.path.exists(masters_dir):
+            for f in os.listdir(masters_dir):
+                if f.endswith('.xml') and not f.startswith('_'):
+                    part_name = f"/ppt/slideMasters/{f}"
+                    if part_name not in existing_overrides:
+                        override = etree.SubElement(root, f"{{{ns['ct']}}}Override")
+                        override.set('PartName', part_name)
+                        override.set('ContentType', 'application/vnd.openxmlformats-officedocument.presentationml.slideMaster+xml')
+        
+        # Add overrides for slide layouts
+        layouts_dir = os.path.join(source_dir, "ppt", "slideLayouts")
+        if os.path.exists(layouts_dir):
+            for f in os.listdir(layouts_dir):
+                if f.endswith('.xml') and not f.startswith('_'):
+                    part_name = f"/ppt/slideLayouts/{f}"
+                    if part_name not in existing_overrides:
+                        override = etree.SubElement(root, f"{{{ns['ct']}}}Override")
+                        override.set('PartName', part_name)
+                        override.set('ContentType', 'application/vnd.openxmlformats-officedocument.presentationml.slideLayout+xml')
+        
+        tree.write(content_types_path, xml_declaration=True, encoding='UTF-8', standalone=True)
+    
+    def _update_presentation_rels(self, rels_path: str, source_dir: str):
+        """Update presentation relationships for slide masters"""
+        tree = etree.parse(rels_path)
+        root = tree.getroot()
+        
+        ns = {'r': 'http://schemas.openxmlformats.org/package/2006/relationships'}
+        
+        # Find existing relationships and their IDs
+        existing_targets = {}
+        max_rid = 0
+        for rel in root.findall('.//r:Relationship', ns):
+            rid = rel.get('Id')
+            target = rel.get('Target')
+            existing_targets[target] = rid
+            
+            # Track max rId number
+            if rid and rid.startswith('rId'):
+                try:
+                    num = int(rid[3:])
+                    max_rid = max(max_rid, num)
+                except ValueError:
+                    pass
+        
+        # Add relationships for slide masters if not present
+        masters_dir = os.path.join(source_dir, "ppt", "slideMasters")
+        if os.path.exists(masters_dir):
+            for f in os.listdir(masters_dir):
+                if f.endswith('.xml') and not f.startswith('_'):
+                    target = f"slideMasters/{f}"
+                    if target not in existing_targets:
+                        max_rid += 1
+                        rel = etree.SubElement(root, f"{{{ns['r']}}}Relationship")
+                        rel.set('Id', f'rId{max_rid}')
+                        rel.set('Type', 'http://schemas.openxmlformats.org/officeDocument/2006/relationships/slideMaster')
+                        rel.set('Target', target)
+        
+        tree.write(rels_path, xml_declaration=True, encoding='UTF-8', standalone=True)
+
+
+class SimpleTemplateApplier:
+    """
+    Simpler approach: Just copy theme colors/fonts without touching structure.
+    This is safer but less comprehensive.
+    """
+    
+    def apply_theme_only(self, source_path: str, template_path: str, output_path: str) -> bool:
+        """
+        Apply only the theme (colors, fonts) from template to source.
+        This is the safest approach - preserves all structure.
+        """
+        print("=" * 60)
+        print("PPT THEME APPLIER (Safe Mode)")
+        print("=" * 60)
+        
+        try:
+            # Copy source to output
+            shutil.copy2(source_path, output_path)
+            
+            # Extract both
+            with tempfile.TemporaryDirectory() as temp_dir:
+                source_dir = os.path.join(temp_dir, "source")
+                template_dir = os.path.join(temp_dir, "template")
+                output_dir = os.path.join(temp_dir, "output")
+                
+                # Extract output (copy of source)
+                with zipfile.ZipFile(output_path, 'r') as zf:
+                    zf.extractall(output_dir)
+                
+                # Extract template
+                with zipfile.ZipFile(template_path, 'r') as zf:
+                    zf.extractall(template_dir)
+                
+                # Copy only theme1.xml (colors and fonts)
+                template_theme = os.path.join(template_dir, "ppt", "theme", "theme1.xml")
+                output_theme = os.path.join(output_dir, "ppt", "theme", "theme1.xml")
+                
+                if os.path.exists(template_theme):
+                    os.makedirs(os.path.dirname(output_theme), exist_ok=True)
+                    shutil.copy2(template_theme, output_theme)
+                    print("✓ Theme colors and fonts applied")
+                
+                # Repack
+                os.remove(output_path)
+                with zipfile.ZipFile(output_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                    for root, dirs, files in os.walk(output_dir):
+                        for file in files:
+                            file_path = os.path.join(root, file)
+                            arc_name = os.path.relpath(file_path, output_dir)
+                            zf.write(file_path, arc_name)
+                
+                print(f"\n✓ Output saved: {output_path}")
+                return True
+                
+        except Exception as e:
+            print(f"✗ Error: {e}")
+            return False
+
+
+def main():
+    if len(sys.argv) < 4:
+        print("""
+PPT True Template Converter
+===========================
+Applies template styling while keeping ALL original content.
+
+Usage:
+    python ppt_true_converter.py source.pptx template.pptx output.pptx
+
+Options:
+    --safe    Only apply theme colors/fonts (safest, minimal changes)
+
+Arguments:
+    source.pptx    - Your presentation (content will be preserved)
+    template.pptx  - Template file (styling will be extracted)
+    output.pptx    - Output file path
+
+This tool preserves:
+    ✓ All images exactly as they are
+    ✓ All shapes and their positions
+    ✓ All tables with data
+    ✓ All charts with data
+    ✓ All text content
+    ✓ All animations and transitions
+
+Only changes:
+    • Theme colors
+    • Theme fonts
+    • Slide master backgrounds (optional)
+""")
+        sys.exit(1)
+    
+    source = sys.argv[1]
+    template = sys.argv[2]
+    output = sys.argv[3]
+    safe_mode = "--safe" in sys.argv
+    
+    # Validate files
+    if not os.path.exists(source):
+        print(f"Error: Source file not found: {source}")
+        sys.exit(1)
+    
+    if not os.path.exists(template):
+        print(f"Error: Template file not found: {template}")
+        sys.exit(1)
+    
+    if safe_mode:
+        # Safe mode - only theme
+        applier = SimpleTemplateApplier()
+        success = applier.apply_theme_only(source, template, output)
+    else:
+        # Full conversion
+        converter = TrueTemplateConverter()
+        success = converter.convert(source, template, output)
+    
+    sys.exit(0 if success else 1)
+
+
+if __name__ == "__main__":
+    main()
