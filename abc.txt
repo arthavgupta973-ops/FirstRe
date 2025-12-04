@@ -1,0 +1,640 @@
+"""
+PPT Template Converter
+======================
+Converts any PowerPoint presentation to a specific company template using:
+1. python-pptx for content extraction
+2. Azure OpenAI (via custom endpoint) for intelligent content interpretation
+3. Plus AI API for generating the new presentation
+
+Usage:
+    python ppt_template_converter.py input.pptx output.pptx
+
+Before running, update the configuration variables below.
+"""
+
+import os
+import sys
+import json
+import time
+import requests
+from pptx import Presentation
+from pptx.enum.shapes import MSO_SHAPE_TYPE
+from typing import Optional, List, Dict, Any
+from dataclasses import dataclass, field
+
+
+# =============================================================================
+# CONFIGURATION - UPDATE THESE VALUES
+# =============================================================================
+
+# Azure OpenAI Configuration (matching your pattern)
+AZURE_OPENAI_API_KEY = ""  # Your API key
+AZURE_OPENAI_BASE_URL = ""  # Your base URL (e.g., "https://your-endpoint.com")
+AZURE_OPENAI_MODEL = "azure.gpt-4o-2024-11-20"  # Your model/deployment name
+
+# Plus AI Configuration
+PLUSAI_API_TOKEN = ""  # Your Plus AI API token
+PLUSAI_TEMPLATE_ID = ""  # Your company template ID
+
+
+# =============================================================================
+# AZURE OPENAI CLIENT (Using your authentication pattern)
+# =============================================================================
+
+class AzureOpenAIClient:
+    """Azure OpenAI client using custom endpoint with Bearer auth"""
+    
+    def __init__(
+        self,
+        api_key: str = AZURE_OPENAI_API_KEY,
+        base_url: str = AZURE_OPENAI_BASE_URL,
+        model: str = AZURE_OPENAI_MODEL
+    ):
+        self.api_key = api_key
+        self.base_url = base_url.rstrip('/')
+        self.model = model
+        self.headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}"
+        }
+    
+    def chat_completion(
+        self,
+        messages: List[Dict[str, str]],
+        max_tokens: int = 4000,
+        temperature: float = 0.3
+    ) -> Optional[str]:
+        """
+        Send a chat completion request (matching your pattern)
+        
+        Args:
+            messages: List of message dicts with 'role' and 'content'
+            max_tokens: Maximum tokens in response
+            temperature: Sampling temperature
+            
+        Returns:
+            Response content string or None on error
+        """
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature
+        }
+        
+        # Using your URL pattern
+        url = f"{self.base_url}/openai/deployments/{self.model}/chat/completions"
+        
+        try:
+            response = requests.post(url, headers=self.headers, json=payload)
+            
+            if response.status_code == 200:
+                data = response.json()
+                content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                return content.strip()
+            else:
+                print(f"Azure OpenAI Error: {response.status_code}, {response.text}")
+                return None
+                
+        except requests.exceptions.RequestException as e:
+            print(f"Request Error: {e}")
+            return None
+
+
+# =============================================================================
+# PPT CONTENT EXTRACTOR
+# =============================================================================
+
+@dataclass
+class SlideContent:
+    """Content extracted from a single slide"""
+    slide_number: int
+    title: str = ""
+    subtitle: str = ""
+    body_text: List[str] = field(default_factory=list)
+    bullet_points: List[str] = field(default_factory=list)
+    tables: List[Dict] = field(default_factory=list)
+    charts: List[Dict] = field(default_factory=list)
+    images: List[str] = field(default_factory=list)
+    speaker_notes: str = ""
+    layout_name: str = ""
+
+
+class PPTExtractor:
+    """Extracts content from PowerPoint presentations"""
+    
+    def __init__(self, pptx_path: str):
+        self.pptx_path = pptx_path
+        self.prs = Presentation(pptx_path)
+    
+    def extract_all(self) -> List[SlideContent]:
+        """Extract content from all slides"""
+        slides = []
+        for idx, slide in enumerate(self.prs.slides):
+            content = self._extract_slide(slide, idx + 1)
+            slides.append(content)
+        return slides
+    
+    def _extract_slide(self, slide, slide_number: int) -> SlideContent:
+        """Extract content from a single slide"""
+        content = SlideContent(slide_number=slide_number)
+        
+        # Get layout name
+        if slide.slide_layout:
+            content.layout_name = slide.slide_layout.name
+        
+        # Process all shapes
+        for shape in slide.shapes:
+            self._process_shape(shape, content)
+        
+        # Extract speaker notes
+        if slide.has_notes_slide:
+            notes_frame = slide.notes_slide.notes_text_frame
+            if notes_frame:
+                content.speaker_notes = notes_frame.text.strip()
+        
+        return content
+    
+    def _process_shape(self, shape, content: SlideContent):
+        """Process a shape and extract its content"""
+        
+        # Text content
+        if shape.has_text_frame:
+            text = self._get_shape_text(shape)
+            if text:
+                if shape.is_placeholder:
+                    ph_type = shape.placeholder_format.type
+                    if ph_type in [1, 3]:  # TITLE, CENTER_TITLE
+                        content.title = text
+                    elif ph_type == 4:  # SUBTITLE
+                        content.subtitle = text
+                    elif ph_type in [2, 7]:  # BODY, OBJECT
+                        if self._is_bulleted(shape):
+                            content.bullet_points.extend(self._get_bullets(shape))
+                        else:
+                            content.body_text.append(text)
+                    else:
+                        content.body_text.append(text)
+                else:
+                    content.body_text.append(text)
+        
+        # Tables
+        if shape.has_table:
+            content.tables.append(self._extract_table(shape.table))
+        
+        # Charts
+        if shape.has_chart:
+            content.charts.append(self._extract_chart(shape.chart))
+        
+        # Images
+        if shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+            content.images.append(f"[Image: {shape.name}]")
+        
+        # Grouped shapes
+        if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
+            for sub_shape in shape.shapes:
+                self._process_shape(sub_shape, content)
+    
+    def _get_shape_text(self, shape) -> str:
+        """Get all text from a shape"""
+        paragraphs = []
+        for para in shape.text_frame.paragraphs:
+            text = "".join(run.text for run in para.runs).strip()
+            if text:
+                paragraphs.append(text)
+        return "\n".join(paragraphs)
+    
+    def _is_bulleted(self, shape) -> bool:
+        """Check if shape has bullet points"""
+        return len(shape.text_frame.paragraphs) > 1
+    
+    def _get_bullets(self, shape) -> List[str]:
+        """Extract bullet points"""
+        bullets = []
+        for para in shape.text_frame.paragraphs:
+            text = "".join(run.text for run in para.runs).strip()
+            if text:
+                level = para.level if para.level else 0
+                indent = "  " * level
+                bullets.append(f"{indent}• {text}")
+        return bullets
+    
+    def _extract_table(self, table) -> Dict:
+        """Extract table data"""
+        rows = []
+        for row in table.rows:
+            cells = [cell.text.strip() for cell in row.cells]
+            rows.append(cells)
+        return {
+            "type": "table",
+            "rows": len(table.rows),
+            "cols": len(table.columns),
+            "data": rows
+        }
+    
+    def _extract_chart(self, chart) -> Dict:
+        """Extract chart info"""
+        title = ""
+        if chart.has_title and chart.chart_title.has_text_frame:
+            title = chart.chart_title.text_frame.text
+        
+        # Try to get series data
+        series_data = []
+        try:
+            for series in chart.series:
+                series_info = {
+                    "name": series.name if hasattr(series, 'name') else "",
+                    "values": list(series.values) if hasattr(series, 'values') else []
+                }
+                series_data.append(series_info)
+        except:
+            pass
+        
+        return {
+            "type": "chart",
+            "chart_type": str(chart.chart_type) if chart.chart_type else "unknown",
+            "title": title,
+            "series": series_data
+        }
+    
+    def get_metadata(self) -> Dict:
+        """Get presentation metadata"""
+        return {
+            "total_slides": len(self.prs.slides),
+            "width_inches": self.prs.slide_width.inches,
+            "height_inches": self.prs.slide_height.inches
+        }
+
+
+# =============================================================================
+# CONTENT INTERPRETER
+# =============================================================================
+
+class ContentInterpreter:
+    """Uses Azure OpenAI to interpret and structure presentation content"""
+    
+    def __init__(self, openai_client: AzureOpenAIClient):
+        self.client = openai_client
+    
+    def interpret(self, slides: List[SlideContent], metadata: Dict) -> str:
+        """
+        Interpret presentation content and generate Plus AI prompt
+        """
+        # Format slides for LLM
+        slides_text = self._format_slides(slides)
+        
+        messages = [
+            {
+                "role": "system",
+                "content": """You are an expert presentation analyst. Your task is to analyze 
+presentation content and create a detailed prompt for recreating it with a new template.
+
+OUTPUT REQUIREMENTS:
+1. Capture ALL key information, data, and messaging
+2. Preserve the logical flow and narrative structure
+3. Include specific numbers, statistics, and quotes exactly as they appear
+4. Describe charts/tables with their actual data so they can be recreated
+5. Note where images should appear and what they should show
+6. Maintain the presentation's tone (formal, casual, persuasive, informative)
+
+Create a comprehensive, well-structured prompt that someone could use to recreate 
+an equivalent presentation without seeing the original. The output will be used 
+directly with Plus AI to generate a new presentation."""
+            },
+            {
+                "role": "user",
+                "content": f"""Analyze this presentation and create a recreation prompt:
+
+METADATA:
+- Total Slides: {metadata['total_slides']}
+- Dimensions: {metadata['width_inches']:.1f}" x {metadata['height_inches']:.1f}"
+
+SLIDE CONTENT:
+{slides_text}
+
+---
+Create a detailed, comprehensive prompt for Plus AI to recreate this presentation 
+with a company template. Include all content, data, and structure."""
+            }
+        ]
+        
+        result = self.client.chat_completion(messages, max_tokens=4000, temperature=0.3)
+        return result or ""
+    
+    def _format_slides(self, slides: List[SlideContent]) -> str:
+        """Format slides for LLM input"""
+        parts = []
+        
+        for slide in slides:
+            text = f"\n{'='*50}\nSLIDE {slide.slide_number}"
+            if slide.layout_name:
+                text += f" ({slide.layout_name})"
+            text += f"\n{'='*50}"
+            
+            if slide.title:
+                text += f"\nTITLE: {slide.title}"
+            if slide.subtitle:
+                text += f"\nSUBTITLE: {slide.subtitle}"
+            if slide.body_text:
+                text += f"\n\nBODY TEXT:\n" + "\n".join(slide.body_text)
+            if slide.bullet_points:
+                text += f"\n\nBULLET POINTS:\n" + "\n".join(slide.bullet_points)
+            if slide.tables:
+                for i, tbl in enumerate(slide.tables):
+                    text += f"\n\nTABLE {i+1} ({tbl['rows']}x{tbl['cols']}):\n"
+                    for row in tbl['data']:
+                        text += " | ".join(row) + "\n"
+            if slide.charts:
+                for i, chart in enumerate(slide.charts):
+                    text += f"\n\nCHART {i+1}: {chart['chart_type']}"
+                    if chart['title']:
+                        text += f" - {chart['title']}"
+                    if chart.get('series'):
+                        for s in chart['series']:
+                            text += f"\n  Series '{s['name']}': {s['values']}"
+            if slide.images:
+                text += f"\n\nIMAGES: " + ", ".join(slide.images)
+            if slide.speaker_notes:
+                text += f"\n\nSPEAKER NOTES:\n{slide.speaker_notes}"
+            
+            parts.append(text)
+        
+        return "\n".join(parts)
+
+
+# =============================================================================
+# PLUS AI CLIENT
+# =============================================================================
+
+class PlusAIClient:
+    """Client for Plus AI Presentations API"""
+    
+    def __init__(
+        self,
+        api_token: str = PLUSAI_API_TOKEN,
+        template_id: str = PLUSAI_TEMPLATE_ID
+    ):
+        self.api_token = api_token
+        self.template_id = template_id
+        self.base_url = "https://api.plusdocs.com/r/v0"
+        self.headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_token}"
+        }
+    
+    def create_presentation(self, prompt: str, num_slides: Optional[int] = None) -> Dict:
+        """Create a new presentation"""
+        url = f"{self.base_url}/presentation"
+        
+        payload = {
+            "prompt": prompt,
+            "language": "en",
+            "includeUserTips": False
+        }
+        
+        if self.template_id:
+            payload["templateId"] = self.template_id
+        
+        if num_slides:
+            payload["numberOfSlides"] = min(num_slides, 30)  # API limit is 30
+        
+        print("Creating presentation with Plus AI...")
+        print(f"  Template ID: {self.template_id or 'default'}")
+        
+        response = requests.post(url, headers=self.headers, json=payload)
+        
+        if response.status_code == 429:
+            raise Exception("Rate limit exceeded. Wait 1-2 minutes and try again.")
+        
+        response.raise_for_status()
+        data = response.json()
+        
+        print(f"✓ Created - ID: {data.get('id', 'unknown')}")
+        return data
+    
+    def poll_for_result(self, polling_url: str, timeout: int = 300) -> Optional[str]:
+        """Poll until presentation is ready"""
+        print("Waiting for generation...")
+        start = time.time()
+        
+        while time.time() - start < timeout:
+            time.sleep(5)
+            
+            response = requests.get(polling_url, headers=self.headers)
+            response.raise_for_status()
+            data = response.json()
+            
+            status = data.get("status", "unknown")
+            elapsed = int(time.time() - start)
+            print(f"  Status: {status} ({elapsed}s)")
+            
+            if status == "GENERATED":
+                print("✓ Generation complete!")
+                return data.get("url")
+            
+            if status in ["FAILED", "ERROR"]:
+                print(f"✗ Failed: {data}")
+                return None
+        
+        print("✗ Timeout")
+        return None
+    
+    def create_and_wait(self, prompt: str, num_slides: Optional[int] = None) -> Optional[str]:
+        """Create presentation and wait for completion"""
+        result = self.create_presentation(prompt, num_slides)
+        
+        polling_url = result.get("pollingUrl")
+        if not polling_url:
+            print("✗ No polling URL returned")
+            return None
+        
+        time.sleep(5)  # Initial wait
+        return self.poll_for_result(polling_url)
+    
+    def download(self, url: str, output_path: str) -> bool:
+        """Download the presentation file"""
+        try:
+            print(f"Downloading to {output_path}...")
+            response = requests.get(url, stream=True)
+            response.raise_for_status()
+            
+            with open(output_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            
+            print("✓ Downloaded!")
+            return True
+        except Exception as e:
+            print(f"✗ Download failed: {e}")
+            return False
+
+
+# =============================================================================
+# MAIN CONVERTER CLASS
+# =============================================================================
+
+class PPTTemplateConverter:
+    """
+    Main converter class that orchestrates the entire process:
+    1. Extract content from source PPT
+    2. Interpret with Azure OpenAI
+    3. Generate with Plus AI
+    4. Download result
+    """
+    
+    def __init__(
+        self,
+        azure_api_key: str = AZURE_OPENAI_API_KEY,
+        azure_base_url: str = AZURE_OPENAI_BASE_URL,
+        azure_model: str = AZURE_OPENAI_MODEL,
+        plusai_token: str = PLUSAI_API_TOKEN,
+        plusai_template: str = PLUSAI_TEMPLATE_ID
+    ):
+        self.openai = AzureOpenAIClient(azure_api_key, azure_base_url, azure_model)
+        self.interpreter = ContentInterpreter(self.openai)
+        self.plusai = PlusAIClient(plusai_token, plusai_template)
+    
+    def convert(
+        self,
+        input_path: str,
+        output_path: str,
+        preserve_slide_count: bool = True,
+        save_debug_files: bool = True
+    ) -> bool:
+        """
+        Convert a presentation to a new template
+        
+        Args:
+            input_path: Source PPTX file
+            output_path: Output PPTX file
+            preserve_slide_count: Try to keep similar number of slides
+            save_debug_files: Save intermediate files for debugging
+            
+        Returns:
+            True if successful
+        """
+        print("=" * 60)
+        print("PPT TEMPLATE CONVERTER")
+        print("=" * 60)
+        
+        # Step 1: Extract content
+        print("\n[STEP 1/4] Extracting content from source PPT...")
+        print("-" * 40)
+        extractor = PPTExtractor(input_path)
+        slides = extractor.extract_all()
+        metadata = extractor.get_metadata()
+        print(f"✓ Extracted {len(slides)} slides")
+        print(f"  Dimensions: {metadata['width_inches']:.1f}\" x {metadata['height_inches']:.1f}\"")
+        
+        # Step 2: Interpret with Azure OpenAI
+        print("\n[STEP 2/4] Interpreting content with Azure OpenAI...")
+        print("-" * 40)
+        prompt = self.interpreter.interpret(slides, metadata)
+        if not prompt:
+            print("✗ Failed to interpret content")
+            return False
+        print(f"✓ Generated prompt ({len(prompt)} characters)")
+        
+        # Save debug files
+        if save_debug_files:
+            with open("debug_extracted.json", "w") as f:
+                json.dump([{
+                    "slide": s.slide_number,
+                    "title": s.title,
+                    "subtitle": s.subtitle,
+                    "body": s.body_text,
+                    "bullets": s.bullet_points,
+                    "tables": s.tables,
+                    "charts": s.charts,
+                    "images": s.images,
+                    "notes": s.speaker_notes
+                } for s in slides], f, indent=2)
+            
+            with open("debug_prompt.txt", "w") as f:
+                f.write(prompt)
+            
+            print("  Debug files saved: debug_extracted.json, debug_prompt.txt")
+        
+        # Step 3: Generate with Plus AI
+        print("\n[STEP 3/4] Generating with Plus AI...")
+        print("-" * 40)
+        num_slides = len(slides) if preserve_slide_count else None
+        download_url = self.plusai.create_and_wait(prompt, num_slides)
+        
+        if not download_url:
+            print("✗ Generation failed")
+            return False
+        
+        # Step 4: Download
+        print("\n[STEP 4/4] Downloading result...")
+        print("-" * 40)
+        success = self.plusai.download(download_url, output_path)
+        
+        if success:
+            print("\n" + "=" * 60)
+            print("SUCCESS!")
+            print("=" * 60)
+            print(f"\n📥 Output file: {output_path}")
+            print(f"🔗 Download URL: {download_url}")
+        
+        return success
+
+
+# =============================================================================
+# COMMAND LINE INTERFACE
+# =============================================================================
+
+def main():
+    """CLI entry point"""
+    if len(sys.argv) < 3:
+        print("""
+PPT Template Converter
+======================
+Convert any PowerPoint to your company template using AI.
+
+Usage:
+    python ppt_template_converter.py input.pptx output.pptx
+
+Before running, update these variables at the top of the script:
+    - AZURE_OPENAI_API_KEY     (your Azure OpenAI API key)
+    - AZURE_OPENAI_BASE_URL    (your Azure OpenAI endpoint)
+    - AZURE_OPENAI_MODEL       (your deployment name, e.g., "azure.gpt-4o-2024-11-20")
+    - PLUSAI_API_TOKEN         (your Plus AI API token)
+    - PLUSAI_TEMPLATE_ID       (your company template ID)
+""")
+        sys.exit(1)
+    
+    input_file = sys.argv[1]
+    output_file = sys.argv[2]
+    
+    # Validate configuration
+    missing = []
+    if not AZURE_OPENAI_API_KEY:
+        missing.append("AZURE_OPENAI_API_KEY")
+    if not AZURE_OPENAI_BASE_URL:
+        missing.append("AZURE_OPENAI_BASE_URL")
+    if not PLUSAI_API_TOKEN:
+        missing.append("PLUSAI_API_TOKEN")
+    if not PLUSAI_TEMPLATE_ID:
+        missing.append("PLUSAI_TEMPLATE_ID")
+    
+    if missing:
+        print("Error: Missing configuration values. Update these in the script:")
+        for m in missing:
+            print(f"  - {m}")
+        sys.exit(1)
+    
+    # Validate input file
+    if not os.path.exists(input_file):
+        print(f"Error: Input file not found: {input_file}")
+        sys.exit(1)
+    
+    # Run conversion
+    converter = PPTTemplateConverter()
+    success = converter.convert(input_file, output_file)
+    
+    sys.exit(0 if success else 1)
+
+
+if __name__ == "__main__":
+    main()
